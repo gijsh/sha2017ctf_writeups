@@ -1,0 +1,93 @@
+Step 1: Reverse the binary
+
+The binary can be reversed relatively easily using a tool like IDA or Hopper.
+
+Refer to hide.py for a python implementation, note in this implementation /dev/urandom was changed to /tmp/urandom just to make sure we get the same output each time we run it as that is easier for debugging. The original binary can be easily 'monkey-patched' to also read /tmp/urandom to confirm the implementation in python and the binary indeed produce the same output.
+
+Step 2: Understand how it works
+
+In essence the flag hider implements a variation of RC4, with the following alterations:
+- A clock function is implemented that shifts the bytes in the key to the right by one and replaces the first one with a new value: K[6] ^ T[K[15]] ^ K[9]
+- Instead of taking the regular values for i and j in the PRGA stage it uses i = K[4] and j = K[10]
+
+It uses an array with magic values called T. If we Google for these values we find various AES implementation files, for example: https://github.com/coron/htable/blob/master/src/aes_rp.c where they occur in tsmult which according to the source is used to "Computes z=x*y in GF(2^8) using four 8-bit tables" so these values aparently represent a way to do multiplication in the GF(2^8) Galois field.
+
+In GF(2^8) addition/substraction are represented by XOR and multiplication can be performed using "Russian Peasant Multiplication algorithm" this is implemented, for example, in pyAES (http://brandon.sternefamily.net/wp-content/uploads/2007/06/pyAES.txt) galoisMult function.
+
+If we look at the first entries of the T table in decimal we see 0, 119, 238 this looks like the galois multiplication table of 119.
+
+Indeed if we use the galoisMult function from pyAES we can reproduce the T table as follows:
+T = [galoisMult(119,x) for x in range(256)]
+
+So the new value computed by the clock function is essentialy: K[6] + K[9] + (119*K[15])
+
+Step 3: Finding a weakness
+
+The first weakness is that at all times we can express i and j as a function of the original key K. 
+
+For example the following shows the values for i and j for the first 15 bytes of random output:
+
+# Clock is called before the first time i and j are used so the first i actually uses K[3] since at that point the clock function has shifted the original K[3] into K[4] which is used to initiaze i
+0: i=1*K[3] j=1*K[9]
+1: i=1*K[2] j=1*K[8]
+2: i=1*K[1] j=1*K[7]
+3: i=1*K[0] j=1*K[6]
+
+# From step 4 we have to take into account that K[0] is recomputed as K[6] + K[9] + 119*K[5] by the clock function
+4: i=1*K[6]+ 1*K[9]+ 119*K[15] j=1*K[5]
+5: i=1*K[5]+ 1*K[8]+ 119*K[14] j=1*K[4]
+6: i=1*K[4]+ 1*K[7]+ 119*K[13] j=1*K[3]
+7: i=1*K[3]+ 1*K[6]+ 119*K[12] j=1*K[2]
+8: i=1*K[2]+ 1*K[5]+ 119*K[11] j=1*K[1]
+9: i=1*K[1]+ 1*K[4]+ 119*K[10] j=1*K[0]
+10: i=1*K[0]+ 1*K[3]+ 119*K[9] j=1*K[6]+ 1*K[9]+ 119*K[15]
+11: i=1*K[2]+ 1*K[6]+ 119*K[8]+ 1*K[9]+ 119*K[15] j=1*K[5]+ 1*K[8]+ 119*K[14]
+12: i=1*K[1]+ 1*K[5]+ 119*K[7]+ 1*K[8]+ 119*K[14] j=1*K[4]+ 1*K[7]+ 119*K[13]
+13: i=1*K[0]+ 1*K[4]+ 119*K[6]+ 1*K[7]+ 119*K[13] j=1*K[3]+ 1*K[6]+ 119*K[12]
+14: i=1*K[3]+ 119*K[5]+ 1*K[9]+ 119*K[12]+ 119*K[15] j=1*K[2]+ 1*K[5]+ 119*K[11]
+15: i=1*K[2]+ 119*K[4]+ 1*K[8]+ 119*K[11]+ 119*K[14] j=1*K[1]+ 1*K[4]+ 119*K[10]
+
+The eq.py program can be used to compute these equations all the way up to i=8191
+
+As can be observed above the value of j is simply the value of i 6 steps before. 
+
+Let's consider two steps that are 6 bytes apart, for example step 4 and step 10.
+
+step4_i=1*K[6]+ 1*K[9]+ 119*K[15]
+step4_j=1*K[5]
+step4 output = S[S[step4_i] + S[step4_j]]
+step10_i=1*K[0]+ 1*K[3]+ 119*K[9]
+step10_j=1*K[6]+ 1*K[9]+ 119*K[15]=step4_i
+step10 output = S[S[step10_i] + S[step4_j]]
+
+Let's assume that by chance (1/256 chance) step4_j is equal to step10_i if that is the case the following is true:
+step4  output = R[4] = S[S[step4_i] + S[step4_j]]
+step10 output = R[10] = S[S[step4_j] + S[step4_j]]
+
+This means that if this happens the output bytes of step4 and step10 are the same. We can observe that this happens because in the output file the same value will occur in byte 4 and byte 10.
+
+After 6 iterations, S is "mostly" the same as it was before. we index it three times, so we assume those three are still the same.
+
+The interesting thing is that if step4_j is equal to step10_i we now have an equation, in this example it would be:
+step4_j = step10_i
+1*K[0]+ 1*K[3]+ 119*K[9] = 1*K[5]
+
+Each time this chance event happens a new equation is available. Since there are 16 unknowns in this equation (K[0]..K[15]) we can solve this if we have at least 16 equations.
+
+The only problem is that we can have false positives where we see the same value at position p and position p+6 but this happens for another reason. 
+When we see the same output value for step 4 and step 10 this means that:
+- either the new R[4] has the same value as the old R[10] and that S position has remained unchanged, or
+- the new R[4] is different but a random swap has conspired to put the value from the old S position there.
+
+The first options is much more likely. This means that if we see the same value at 6 positions further along, we can be reasonably sure about a relationship between the different R values.
+
+This can be solved by finding all the potential equations and attempting to solve a random subset of 16 of them. If that doesn't work, try again with another subset of 16 equations, etc until we get a combination that yields the correct key.
+
+Step 4: Solving a set of equations in GF(2^8)
+We can use a standard method for solving a set of equations, for example, Gaussian elimination, implemented here https://martin-thoma.com/solving-linear-equations-with-gaussian-elimination/ can be used. It needs to be slightly modified to work in GF(2^8).
+
+Once this is done we can run the final solver (solve.py) and get the flag. Takes about 1 minute on average:
+
+FOUND KEY: [145, 82, 219, 254, 228, 165, 78, 137, 72, 118, 132, 93, 12, 192, 156, 254]
+flag{1e3c496f0632033dbb1c369aca32fc4c}
+pypy solve.py flag.enc  61.59s user 0.02s system 99% cpu 1:01.62 total
